@@ -6,7 +6,7 @@
    is always fetched fresh so both devices stay in sync.
    Bump CACHE when you change the shell to force a refresh.
    ============================================================ */
-const CACHE = "poopuri-v2";
+const CACHE = "poopuri-v3";
 const SHELL = [
   "./",
   "./index.html",

@@ -63,8 +63,11 @@ Android: ⋮ menu → Install app). Launch it from the icon for full-screen + lo
 - **It's unlisted, not locked.** Anyone who has your exact URL could open it and
   add/remove songs. It's meant for just the two of you — don't post the link
   publicly. (If you ever want a password on it, say so and I'll add one.)
-- **Playing a song needs internet** (it streams from your cloud library). The app
-  screen itself works offline once installed.
+- **Works offline.** Each song is quietly saved onto your device the first time
+  the app sees it online (watch for the pink ✓ on each row = "saved for offline").
+  After that it plays with no connection, and the app opens offline too. The cloud
+  is still the shared source of truth, so a song added on the laptop appears on the
+  phone the next time the phone is online — then it caches there as well.
 - **Only upload music you own / have the right to use.** It's your private storage.
 - Vercel Blob's free tier is generous, but it isn't unlimited — it's sized for a
   personal library, not thousands of albums.

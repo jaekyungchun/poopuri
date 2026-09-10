@@ -127,6 +127,9 @@
     }
     .del:active{color:#ff7a9c;opacity:1}
     .del svg{width:17px;height:17px}
+    .off{flex:none;width:20px;display:flex;align-items:center;justify-content:center;color:var(--muted);opacity:.5}
+    .off svg{width:15px;height:15px}
+    .off.saved{color:var(--pink);opacity:.95}
 
     .drop{
       text-align:center;color:var(--muted);font-size:14px;line-height:1.6;
@@ -261,6 +264,9 @@
     var repeat = "off";
     var seeking = false;
     var busy = false;
+    var objUrl = null;   // object URL of the currently-playing cached blob
+    var cached = {};      // url -> true once the song's audio is saved on-device
+    var syncMsg = null;   // shown in place of the count while caching for offline
 
     function fmt(s) {
       if (!isFinite(s) || s < 0) s = 0;
@@ -274,16 +280,105 @@
       if (!sticky) toastTimer = setTimeout(function () { el.toast.classList.remove("show"); }, 2400);
     }
 
-    // ---------- library (shared, from the cloud) ----------
+    // ---------- on-device cache (so songs play offline) ----------
+    // Store "audio" holds the actual song bytes keyed by their cloud URL;
+    // store "meta" holds the last song list so the app opens with no network.
+    var DB_NAME = "poopuri", DB_VER = 1, dbPromise = null;
+    function openDB() {
+      if (!("indexedDB" in window)) return Promise.reject();
+      if (dbPromise) return dbPromise;
+      dbPromise = new Promise(function (res, rej) {
+        var req = indexedDB.open(DB_NAME, DB_VER);
+        req.onupgradeneeded = function () {
+          var db = req.result;
+          if (!db.objectStoreNames.contains("audio")) db.createObjectStore("audio");
+          if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta");
+        };
+        req.onsuccess = function () { res(req.result); };
+        req.onerror = function () { rej(req.error); };
+      });
+      return dbPromise;
+    }
+    function idbGet(store, key) {
+      return openDB().then(function (db) { return new Promise(function (res, rej) {
+        var r = db.transaction(store).objectStore(store).get(key);
+        r.onsuccess = function () { res(r.result); }; r.onerror = function () { rej(r.error); };
+      }); });
+    }
+    function idbPut(store, key, val) {
+      return openDB().then(function (db) { return new Promise(function (res, rej) {
+        var t = db.transaction(store, "readwrite"); t.objectStore(store).put(val, key);
+        t.oncomplete = function () { res(); }; t.onerror = function () { rej(t.error); };
+      }); });
+    }
+    function idbDel(store, key) {
+      return openDB().then(function (db) { return new Promise(function (res, rej) {
+        var t = db.transaction(store, "readwrite"); t.objectStore(store).delete(key);
+        t.oncomplete = function () { res(); }; t.onerror = function () { rej(t.error); };
+      }); });
+    }
+    function idbHas(store, key) {
+      return openDB().then(function (db) { return new Promise(function (res, rej) {
+        var r = db.transaction(store).objectStore(store).getKey(key);
+        r.onsuccess = function () { res(r.result !== undefined); }; r.onerror = function () { rej(r.error); };
+      }); }).catch(function () { return false; });
+    }
+
+    // ---------- library (shared cloud list, cached for offline) ----------
     function loadSongs() {
       return fetch("api/songs", { cache: "no-store" })
-        .then(function (r) { return r.ok ? r.json() : { songs: [] }; })
+        .then(function (r) { if (!r.ok) throw new Error("bad status"); return r.json(); })
         .then(function (data) {
           songs = (data && data.songs) || [];
-          buildOrder(current() ? songs.findIndex(function (s) { return s.url === current().url; }) : null);
-          render();
+          idbPut("meta", "list", songs).catch(function () {});
+          afterList(false);
         })
-        .catch(function () { songs = []; render(); });
+        .catch(function () {
+          // offline (or the API failed): fall back to the last saved list
+          return idbGet("meta", "list").then(function (saved) {
+            songs = saved || [];
+            afterList(true);
+          }).catch(function () { songs = []; render(); });
+        });
+    }
+
+    // Reconcile order, refresh which songs are saved on-device, then (online)
+    // download any that aren't yet. Playback keeps working throughout.
+    function afterList(offline) {
+      var here = current();
+      buildOrder(here ? songs.findIndex(function (s) { return s.url === here.url; }) : null);
+      render();
+      Promise.all(songs.map(function (s) {
+        return idbHas("audio", s.url).then(function (h) { if (h) cached[s.url] = true; });
+      })).then(function () {
+        render();
+        if (!offline) syncOffline();
+      });
+    }
+
+    // Download every not-yet-saved song into the cache, one at a time. Failures
+    // are skipped and retried next load; nothing blocks playback.
+    function syncOffline() {
+      if (!navigator.onLine) return;
+      var missing = songs.filter(function (s) { return !cached[s.url]; });
+      if (!missing.length) { setSync(null); return; }
+      var i = 0;
+      (function step() {
+        if (i >= missing.length) { setSync(null); render(); return; }
+        var s = missing[i];
+        setSync("saving " + (i + 1) + "/" + missing.length + " for offline…");
+        fetch(s.url, { mode: "cors", cache: "no-store" })
+          .then(function (r) { if (!r.ok) throw new Error(); return r.blob(); })
+          .then(function (b) { return idbPut("audio", s.url, b); })
+          .then(function () { cached[s.url] = true; render(); })
+          .catch(function () {})
+          .then(function () { i++; step(); });
+      })();
+    }
+    function setSync(msg) { syncMsg = msg; updateCount(); }
+    function updateCount() {
+      if (syncMsg) { el.count.textContent = syncMsg; return; }
+      el.count.textContent = songs.length ? (songs.length + (songs.length === 1 ? " song" : " songs")) : "";
     }
 
     function setBusy(on, label) {
@@ -310,7 +405,13 @@
               access: "public",
               handleUploadUrl: "api/upload",
               contentType: f.type || undefined,
-            }).then(function () { done++; });
+            }).then(function (res) {
+              done++;
+              // we already hold the bytes locally — save them for offline now
+              if (res && res.url) {
+                idbPut("audio", res.url, f).then(function () { cached[res.url] = true; }).catch(function () {});
+              }
+            });
           });
         });
         return chain.then(function () {
@@ -330,6 +431,7 @@
           if (!r.ok) throw new Error();
           var idx = songs.findIndex(function (s) { return s.url === url; });
           if (idx >= 0) songs.splice(idx, 1);
+          delete cached[url]; idbDel("audio", url).catch(function () {});
           if (wasCurrent) { audio.pause(); audio.removeAttribute("src"); pos = -1; }
           buildOrder(current() ? songs.findIndex(function (s) { return s.url === current().url; }) : null);
           render(); updateNowPlaying(); toast("removed");
@@ -361,7 +463,7 @@
     function render() {
       var has = songs.length > 0;
       el.drop.style.display = has ? "none" : "";
-      el.count.textContent = has ? (songs.length + (songs.length === 1 ? " song" : " songs")) : "";
+      updateCount();
       el.list.innerHTML = "";
       var activeIdx = current() ? order[pos] : -1;
       songs.forEach(function (song, i) {
@@ -380,6 +482,14 @@
         if (song.artist) main.querySelector(".li-artist").textContent = song.artist;
         main.addEventListener("click", function () { playIndex(i); });
 
+        var off = document.createElement("div");
+        var isSaved = !!cached[song.url];
+        off.className = "off" + (isSaved ? " saved" : "");
+        off.title = isSaved ? "saved for offline" : "streams online";
+        off.innerHTML = isSaved
+          ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>'
+          : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>';
+
         var del = document.createElement("button");
         del.className = "del"; del.title = "remove"; del.setAttribute("aria-label", "remove");
         del.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>';
@@ -388,7 +498,7 @@
           if (confirm('Remove "' + (song.title || song.name) + '" for both of you?')) removeSong(song.url);
         });
 
-        li.appendChild(idx); li.appendChild(main); li.appendChild(del);
+        li.appendChild(idx); li.appendChild(main); li.appendChild(off); li.appendChild(del);
         el.list.appendChild(li);
       });
     }
@@ -410,9 +520,18 @@
     function loadAndPlay() {
       var s = current();
       if (!s) return;
-      audio.src = s.url;
-      audio.play().catch(function () {});
-      updateNowPlaying(); render();
+      updateNowPlaying();
+      idbGet("audio", s.url).then(function (blob) {
+        if (current() !== s) return; // user moved on while we were reading
+        if (objUrl) { URL.revokeObjectURL(objUrl); objUrl = null; }
+        if (blob) { objUrl = URL.createObjectURL(blob); audio.src = objUrl; }   // offline-ready copy
+        else if (navigator.onLine) { audio.src = s.url; }                        // stream from cloud
+        else { el.npArtist.textContent = "not saved offline yet 😕"; render(); return; }
+        audio.play().catch(function () {});
+        render();
+      }).catch(function () {
+        audio.src = s.url; audio.play().catch(function () {}); render();
+      });
     }
     function togglePlay() {
       if (pos < 0) { if (songs.length) playIndex(0); return; }
@@ -511,7 +630,12 @@
       if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
     });
 
+    // ---------- online / offline ----------
+    window.addEventListener("online", function () { toast("back online — syncing ♥"); loadSongs(); });
+    window.addEventListener("offline", function () { toast("offline — playing saved songs"); });
+
     // ---------- boot ----------
+    if (navigator.storage && navigator.storage.persist) { navigator.storage.persist().catch(function () {}); }
     loadSongs();
     if ("serviceWorker" in navigator) {
       window.addEventListener("load", function () { navigator.serviceWorker.register("sw.js").catch(function () {}); });
