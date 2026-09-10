@@ -221,7 +221,7 @@
   </div>
 
   <audio id="audio" preload="metadata" crossorigin="anonymous"></audio>
-  <input type="file" id="filePicker" accept="audio/*,.mp3,.m4a,.aac,.ogg,.opus,.wav,.flac,.webm" multiple hidden />
+  <input type="file" id="filePicker" accept="audio/mpeg,audio/mp4,audio/aac,audio/ogg,.mp3,.m4a,.aac,.ogg,.opus,.webm" multiple hidden />
   <div class="toast" id="toast"></div>
 
   <script>
@@ -273,6 +273,14 @@
       var m = Math.floor(s / 60), r = Math.floor(s % 60);
       return m + ":" + (r < 10 ? "0" : "") + r;
     }
+    function humanSize(bytes) {
+      if (!bytes) return "";
+      var mb = bytes / 1048576;
+      return mb >= 1024 ? (mb / 1024).toFixed(1) + " GB" : Math.round(mb) + " MB";
+    }
+    // Keep the library inside the free storage tier: no lossless, nothing huge.
+    var MAX_MB = 25;
+    var BIG_EXT = /\.(flac|wav|aiff?|alac|ape|wv|dsf)$/i;
     var toastTimer;
     function toast(msg, sticky) {
       el.toast.textContent = msg; el.toast.classList.add("show");
@@ -378,7 +386,10 @@
     function setSync(msg) { syncMsg = msg; updateCount(); }
     function updateCount() {
       if (syncMsg) { el.count.textContent = syncMsg; return; }
-      el.count.textContent = songs.length ? (songs.length + (songs.length === 1 ? " song" : " songs")) : "";
+      if (!songs.length) { el.count.textContent = ""; return; }
+      var total = songs.reduce(function (a, s) { return a + (s.size || 0); }, 0);
+      el.count.textContent = songs.length + (songs.length === 1 ? " song" : " songs") +
+        (total ? " · " + humanSize(total) : "");
     }
 
     function setBusy(on, label) {
@@ -389,10 +400,19 @@
 
     function addFiles(fileList) {
       if (busy) return;
-      var files = Array.prototype.slice.call(fileList || []).filter(function (f) {
-        return (f.type && f.type.indexOf("audio") === 0) || AUDIO_EXT.test(f.name);
+      var all = Array.prototype.slice.call(fileList || []);
+      var files = [], rejected = 0;
+      all.forEach(function (f) {
+        var isAudio = (f.type && f.type.indexOf("audio") === 0) || AUDIO_EXT.test(f.name);
+        if (!isAudio) return;
+        if (BIG_EXT.test(f.name) || f.size > MAX_MB * 1048576) { rejected++; return; }
+        files.push(f);
       });
-      if (!files.length) { toast("no audio files there 🤔"); return; }
+      if (rejected) {
+        toast("skipped " + rejected + " big file" + (rejected > 1 ? "s" : "") +
+              " — use MP3/M4A under " + MAX_MB + "MB (FLAC/WAV are too large)");
+      }
+      if (!files.length) { if (!rejected) toast("no audio files there 🤔"); return; }
 
       setBusy(true, " uploading…");
       import(BLOB_CLIENT).then(function (blob) {
@@ -598,7 +618,17 @@
       el.seek.value = pct; el.seek.style.setProperty("--pct", (pct / 10) + "%");
     });
     audio.addEventListener("loadedmetadata", function () { el.dur.textContent = fmt(audio.duration); });
-    audio.addEventListener("error", function () { if (audio.src) el.npArtist.textContent = "couldn't play this file 😬"; });
+    audio.addEventListener("error", function () {
+      if (!audio.src) return;
+      el.npArtist.textContent = "couldn't play this file 😬";
+      var s = current();
+      if (s && audio.src === s.url && navigator.onLine) {
+        // Distinguish a blocked/over-limit store (403) from a bad file.
+        fetch(s.url, { mode: "cors", headers: { Range: "bytes=0-1" } })
+          .then(function (r) { if (r.status === 403) el.npArtist.textContent = "storage is over its free limit ⚠️"; })
+          .catch(function () {});
+      }
+    });
 
     el.seek.addEventListener("input", function () {
       seeking = true; var d = audio.duration || 0;
