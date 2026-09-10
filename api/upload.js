@@ -1,40 +1,33 @@
 /* ============================================================
-   poopuri — upload token endpoint
-   The browser uploads audio files DIRECTLY to Vercel Blob (so big
-   songs aren't capped by the serverless body limit). This function
-   just hands the browser a short-lived, scoped upload token.
-   Requires a Blob store linked to the project, which sets the
-   BLOB_READ_WRITE_TOKEN env var automatically.
+   poopuri — upload endpoint (Cloudflare R2)
+   The browser asks for a short-lived presigned PUT URL and uploads
+   the file DIRECTLY to R2 (so big songs aren't capped by the
+   serverless body limit). We never see the bytes here.
    ============================================================ */
-import { handleUpload } from "@vercel/blob/client";
-
-const ALLOWED = [
-  "audio/mpeg", "audio/mp3", "audio/mp4", "audio/aac", "audio/x-m4a",
-  "audio/ogg", "audio/opus", "audio/wav", "audio/x-wav", "audio/flac",
-  "audio/x-flac", "audio/webm", "application/octet-stream",
-];
+import { PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { s3, BUCKET, PREFIX, contentTypeFor, publicUrl, missingEnv } from "./_r2.js";
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    res.status(405).json({ error: "POST only" });
-    return;
-  }
+  if (req.method !== "POST") { res.status(405).json({ error: "POST only" }); return; }
+  const miss = missingEnv();
+  if (miss.length) { res.status(500).json({ error: "storage not configured: missing " + miss.join(", ") }); return; }
   try {
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-    const json = await handleUpload({
-      body,
-      request: req,
-      onBeforeGenerateToken: async () => ({
-        allowedContentTypes: ALLOWED,
-        addRandomSuffix: false,          // keep the real filename (title/artist live in it)
-        maximumSizeInBytes: 60 * 1024 * 1024, // 60 MB per song is plenty
-      }),
-      // Fires after the upload finishes (only on a public URL, not localhost).
-      // We refresh the list from the client instead, so nothing to do here.
-      onUploadCompleted: async () => {},
-    });
-    res.status(200).json(json);
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const rawName = String(body.name || "").trim();
+    if (!rawName) { res.status(400).json({ error: "name required" }); return; }
+
+    // Keep the readable filename (title/artist live in it); only strip path
+    // separators and control chars — spaces, hyphens, parens are fine as keys.
+    const safeName = rawName.replace(/[\\/]+/g, "_").replace(/[\x00-\x1f]/g, "").trim();
+    const key = PREFIX + safeName;
+    const contentType = contentTypeFor(safeName);
+
+    const cmd = new PutObjectCommand({ Bucket: BUCKET, Key: key, ContentType: contentType });
+    const uploadUrl = await getSignedUrl(s3, cmd, { expiresIn: 600 });
+
+    res.status(200).json({ uploadUrl, url: publicUrl(key), key, contentType });
   } catch (err) {
-    res.status(400).json({ error: err?.message || "upload failed" });
+    res.status(500).json({ error: err?.message || "upload failed" });
   }
 }

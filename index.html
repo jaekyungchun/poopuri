@@ -228,10 +228,9 @@
   (function () {
     "use strict";
 
-    // Vercel Blob browser client (uploads go straight to storage, so
-    // big songs aren't capped by the serverless request limit).
-    var BLOB_CLIENT = "https://esm.sh/@vercel/blob@0.27/client";
-
+    // Uploads go straight to cloud storage (Cloudflare R2) via a
+    // short-lived presigned URL, so big songs aren't capped by the
+    // serverless request limit.
     var audio = document.getElementById("audio");
     var el = {
       list: document.getElementById("list"),
@@ -415,38 +414,45 @@
       if (!files.length) { if (!rejected) toast("no audio files there 🤔"); return; }
 
       setBusy(true, " uploading…");
-      import(BLOB_CLIENT).then(function (blob) {
-        var done = 0;
-        var chain = Promise.resolve();
-        files.forEach(function (f) {
-          chain = chain.then(function () {
-            toast("uploading " + (done + 1) + "/" + files.length + " · " + f.name, true);
-            return blob.upload("poopuri/" + f.name, f, {
-              access: "public",
-              handleUploadUrl: "api/upload",
-              contentType: f.type || undefined,
-            }).then(function (res) {
+      var done = 0;
+      var chain = Promise.resolve();
+      files.forEach(function (f) {
+        chain = chain.then(function () {
+          toast("uploading " + (done + 1) + "/" + files.length + " · " + f.name, true);
+          // 1) ask our server for a presigned PUT url
+          return fetch("api/upload", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ name: f.name, contentType: f.type || "" }),
+          }).then(function (r) {
+            if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || ("upload " + r.status)); });
+            return r.json();
+          }).then(function (info) {
+            // 2) upload the bytes straight to storage
+            return fetch(info.uploadUrl, {
+              method: "PUT", headers: { "Content-Type": info.contentType }, body: f,
+            }).then(function (pr) {
+              if (!pr.ok) throw new Error("storage PUT " + pr.status);
               done++;
-              // we already hold the bytes locally — save them for offline now
-              if (res && res.url) {
-                idbPut("audio", res.url, f).then(function () { cached[res.url] = true; }).catch(function () {});
-              }
+              // we already hold the bytes — save them for offline right away
+              idbPut("audio", info.url, f).then(function () { cached[info.url] = true; }).catch(function () {});
             });
           });
         });
-        return chain.then(function () {
-          return loadSongs().then(function () {
-            toast("added " + done + " song" + (done === 1 ? "" : "s") + " 🎉");
-          });
+      });
+      chain.then(function () {
+        return loadSongs().then(function () {
+          toast("added " + done + " song" + (done === 1 ? "" : "s") + " 🎉");
         });
       }).catch(function (err) {
         toast("upload failed: " + (err && err.message ? err.message : "try again"));
       }).finally(function () { setBusy(false); });
     }
 
-    function removeSong(url) {
+    function removeSong(song) {
+      var url = song.url;
       var wasCurrent = current() && current().url === url;
-      fetch("api/songs?url=" + encodeURIComponent(url), { method: "DELETE" })
+      var q = song.key ? "key=" + encodeURIComponent(song.key) : "url=" + encodeURIComponent(url);
+      fetch("api/songs?" + q, { method: "DELETE" })
         .then(function (r) {
           if (!r.ok) throw new Error();
           var idx = songs.findIndex(function (s) { return s.url === url; });
@@ -515,7 +521,7 @@
         del.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>';
         del.addEventListener("click", function (e) {
           e.stopPropagation();
-          if (confirm('Remove "' + (song.title || song.name) + '" for both of you?')) removeSong(song.url);
+          if (confirm('Remove "' + (song.title || song.name) + '" for both of you?')) removeSong(song);
         });
 
         li.appendChild(idx); li.appendChild(main); li.appendChild(off); li.appendChild(del);

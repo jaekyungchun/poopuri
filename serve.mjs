@@ -1,15 +1,17 @@
 /* Local dev server for poopuri.
-   In production, Vercel serves the static files and runs /api/*.
-   This little server does two things so you can preview locally:
-     • serves the app shell (with HTTP range support for seeking)
-     • MOCKS the song library from a local ".devsongs/" folder, so
-       GET/DELETE /api/songs behave like the real cloud API.
-   The real UPLOAD path (drag-drop) talks directly to Vercel Blob and
-   only works on a deploy — locally, drop files into ".devsongs/" to
-   see them in the list. Run:  node serve.mjs
+   In production, Vercel serves the static files and runs /api/* against
+   Cloudflare R2. This little server MOCKS that R2 flow against a local
+   ".devsongs/" folder so the whole app (upload, list, play, delete,
+   offline cache) works locally with no cloud:
+     • POST /api/upload  -> a local presigned-style PUT url
+     • PUT  /devupload   -> saves the bytes into .devsongs/
+     • GET  /api/songs   -> lists .devsongs/ as the library
+     • DELETE /api/songs -> removes one
+     • GET  /devsongs/*  -> serves the audio (with range support)
+   Run:  node serve.mjs
 */
 import { createServer } from "node:http";
-import { createReadStream, statSync, readdirSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
+import { createReadStream, createWriteStream, statSync, readdirSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
 import { resolve, extname, normalize, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -61,12 +63,16 @@ createServer((req, res) => {
   const u = new URL(req.url, "http://localhost");
   const path = decodeURIComponent(u.pathname);
 
+  const ctFor = (name) => TYPES[extname(name).toLowerCase()] || "application/octet-stream";
+  const keyToName = (key) => basename(decodeURIComponent(key).replace(/^poopuri\//, ""));
+
   // --- mock API: song library ---
   if (path === "/api/songs") {
     if (req.method === "GET") {
       const songs = readdirSync(DEV_SONGS).filter((f) => AUDIO_EXT.test(f)).map((f) => {
         const p = pretty(f);
-        return { url: "/devsongs/" + encodeURIComponent(f), name: f, title: p.title, artist: p.artist,
+        return { url: "/devsongs/" + encodeURIComponent(f), key: "poopuri/" + f, name: f,
+          title: p.title, artist: p.artist,
           size: statSync(resolve(DEV_SONGS, f)).size, uploadedAt: statSync(resolve(DEV_SONGS, f)).mtime.toISOString() };
       });
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
@@ -74,8 +80,7 @@ createServer((req, res) => {
       return;
     }
     if (req.method === "DELETE") {
-      const url = u.searchParams.get("url") || "";
-      const name = basename(decodeURIComponent(url));
+      const name = keyToName(u.searchParams.get("key") || basename(u.searchParams.get("url") || ""));
       try { unlinkSync(resolve(DEV_SONGS, name)); res.writeHead(200).end('{"ok":true}'); }
       catch { res.writeHead(404).end('{"error":"not found"}'); }
       return;
@@ -83,9 +88,33 @@ createServer((req, res) => {
     res.writeHead(405).end('{"error":"GET or DELETE"}');
     return;
   }
-  if (path === "/api/upload") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end('{"error":"local mock: drop files into .devsongs/ instead"}');
+
+  // --- mock API: hand back a local "presigned" PUT url ---
+  if (path === "/api/upload" && req.method === "POST") {
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      let name = "song";
+      try { name = String(JSON.parse(raw).name || "song").replace(/[\\/]+/g, "_"); } catch {}
+      const key = "poopuri/" + name;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        uploadUrl: "/devupload?key=" + encodeURIComponent(key),
+        url: "/devsongs/" + encodeURIComponent(name), key, contentType: ctFor(name),
+      }));
+    });
+    return;
+  }
+
+  // --- mock storage: accept the PUT and write it into .devsongs/ ---
+  if (path === "/devupload" && req.method === "PUT") {
+    const name = keyToName(u.searchParams.get("key") || "");
+    const dest = normalize(resolve(DEV_SONGS, name));
+    if (!name || !dest.startsWith(DEV_SONGS)) { res.writeHead(400).end(); return; }
+    const ws = createWriteStream(dest);
+    req.pipe(ws);
+    ws.on("finish", () => res.writeHead(200).end());
+    ws.on("error", () => res.writeHead(500).end());
     return;
   }
 
